@@ -2014,101 +2014,131 @@ async function startExport() {
       toast('Export complete!', 'success');
     };
 
-    recorder.start();
+    // ── Real-time playback export ──────────────────────────────────────────
+    // Instead of seeking frame-by-frame (which freezes the browser), we play
+    // the video in real time and use requestAnimationFrame to composite each
+    // frame onto the output canvas. This keeps the browser fully responsive.
 
-    // Render frames
     const offVid = document.createElement('video');
-    offVid.src = state.videoUrl;
+    offVid.src   = state.videoUrl;
     offVid.muted = true;
     await new Promise(r => { offVid.onloadedmetadata = r; offVid.load(); });
 
-    // Play through each keep segment frame-by-frame
-    let exportedDuration = 0;
     const totalKeepDuration = keepSegments.reduce((s, seg) => s + (seg.end - seg.start), 0);
+    let   exportedTime      = 0;
+    let   rafId             = null;
+    let   cancelled         = false;
 
-    for (const seg of keepSegments) {
-      offVid.currentTime = seg.start;
-      await new Promise(r => { offVid.onseeked = r; });
+    // Cancel button wires into this flag
+    document.getElementById('btn-cancel-export').onclick = () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+      offVid.pause();
+      recorder.stop();
+      document.getElementById('export-modal').classList.remove('open');
+      toast('Export cancelled');
+    };
 
-      const segDur = seg.end - seg.start;
-      const frameCount = Math.ceil(segDur * fps);
-      const frameStep  = segDur / frameCount;
+    recorder.start();
 
-      for (let fi = 0; fi < frameCount; fi++) {
-        offVid.currentTime = seg.start + fi * frameStep;
-        await new Promise(r => { offVid.onseeked = r; });
+    // Composite one frame onto the output canvas
+    function compositeFrame() {
+      const t  = offVid.currentTime;
+      const kf = getZoomAtTime(t);
 
-        // Get zoom transform for this frame time
-        const t       = offVid.currentTime;
-        const kf      = getZoomAtTime(t);
-        const srcX    = cropRect.x + (1 - 1/kf.zoom) * cropRect.w/2 - kf.panX * cropRect.w;
-        const srcY    = cropRect.y + (1 - 1/kf.zoom) * cropRect.h/2 - kf.panY * cropRect.h;
-        const srcW    = cropRect.w / kf.zoom;
-        const srcH    = cropRect.h / kf.zoom;
+      const srcX = cropRect.x + (1 - 1/kf.zoom) * cropRect.w/2 - kf.panX * cropRect.w;
+      const srcY = cropRect.y + (1 - 1/kf.zoom) * cropRect.h/2 - kf.panY * cropRect.h;
+      const srcW = cropRect.w / kf.zoom;
+      const srcH = cropRect.h / kf.zoom;
 
-        ectx.drawImage(offVid, srcX, srcY, srcW, srcH, 0, 0, oc.width, oc.height);
+      ectx.drawImage(offVid, srcX, srcY, srcW, srcH, 0, 0, oc.width, oc.height);
 
-        // Draw annotations for this time
-        const annos = state.annotations.filter(a => Math.abs(a.time - t) < 0.5);
-        annos.forEach(a => {
-          const ax = a.x * oc.width;
-          const ay = a.y * oc.height;
-          const aw = a.w * oc.width;
-          const ah = a.h * oc.height;
-          ectx.save();
-          ectx.globalAlpha = a.opacity;
-          if (a.type === 'text') {
-            ectx.font = `bold ${a.size * (oc.width / annoCanvas.width)}px DM Mono, monospace`;
-            ectx.fillStyle = a.color;
-            ectx.strokeStyle = 'rgba(0,0,0,0.6)';
-            ectx.lineWidth = 3;
-            ectx.strokeText(a.text, ax, ay);
-            ectx.fillText(a.text, ax, ay);
-          } else if (a.type === 'rect') {
-            ectx.strokeStyle = a.color;
-            ectx.lineWidth = a.size / 4;
-            ectx.strokeRect(ax, ay, aw, ah);
-          } else if (a.type === 'arrow') {
-            drawArrow(ectx, ax, ay, ax+aw, ay+ah, a.color, a.size * (oc.width / annoCanvas.width));
-          } else if (a.type === 'blur') {
-            ectx.filter = 'blur(8px)';
-            ectx.fillStyle = 'rgba(0,0,0,0.6)';
-            ectx.fillRect(ax, ay, aw, ah);
-          }
-          ectx.restore();
-        });
-
-        // Draw caption
-        const cap = state.captions.find(c => t >= c.start && t <= c.end);
-        if (cap) {
-          const fs   = Math.round(oc.height * 0.035);
-          ectx.font  = `${fs}px DM Mono, monospace`;
-          const tw   = ectx.measureText(cap.text).width;
-          const cx   = oc.width / 2;
-          const cy   = oc.height * 0.88;
-          const pad  = 12;
-          ectx.fillStyle = 'rgba(0,0,0,0.72)';
-          ectx.beginPath();
-          ectx.roundRect(cx - tw/2 - pad, cy - fs - pad/2, tw + pad*2, fs + pad, 4);
-          ectx.fill();
-          ectx.fillStyle = '#ffffff';
-          ectx.textAlign = 'center';
-          ectx.fillText(cap.text, cx, cy);
-          ectx.textAlign = 'left';
+      // Annotations
+      state.annotations.filter(a => Math.abs(a.time - t) < 0.5).forEach(a => {
+        const ax = a.x * oc.width, ay = a.y * oc.height;
+        const aw = a.w * oc.width, ah = a.h * oc.height;
+        ectx.save();
+        ectx.globalAlpha = a.opacity;
+        if (a.type === 'text') {
+          ectx.font = `bold ${a.size * (oc.width / annoCanvas.width)}px DM Mono, monospace`;
+          ectx.fillStyle = a.color;
+          ectx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ectx.lineWidth = 3;
+          ectx.strokeText(a.text, ax, ay);
+          ectx.fillText(a.text, ax, ay);
+        } else if (a.type === 'rect') {
+          ectx.strokeStyle = a.color;
+          ectx.lineWidth = a.size / 4;
+          ectx.strokeRect(ax, ay, aw, ah);
+        } else if (a.type === 'arrow') {
+          drawArrow(ectx, ax, ay, ax+aw, ay+ah, a.color, a.size * (oc.width / annoCanvas.width));
+        } else if (a.type === 'blur') {
+          ectx.filter = 'blur(8px)';
+          ectx.fillStyle = 'rgba(0,0,0,0.55)';
+          ectx.fillRect(ax, ay, aw, ah);
         }
+        ectx.restore();
+      });
 
-        // Hold frame for 1/fps seconds
-        await new Promise(r => setTimeout(r, 1000 / fps));
-
-        exportedDuration += frameStep;
-        setExportProgress(
-          exportedDuration / totalKeepDuration * 100,
-          `Rendering… ${fmt(exportedDuration, 1)} / ${fmt(totalKeepDuration, 1)}`
-        );
+      // Caption
+      const cap = state.captions.find(c => t >= c.start && t <= c.end);
+      if (cap) {
+        const fs  = Math.round(oc.height * 0.035);
+        ectx.font = `${fs}px DM Mono, monospace`;
+        const tw  = ectx.measureText(cap.text).width;
+        const cx  = oc.width / 2, cy = oc.height * 0.88, pad = 12;
+        ectx.fillStyle = 'rgba(0,0,0,0.72)';
+        ectx.beginPath();
+        ectx.roundRect(cx - tw/2 - pad, cy - fs - pad/2, tw + pad*2, fs + pad, 4);
+        ectx.fill();
+        ectx.fillStyle = '#fff';
+        ectx.textAlign = 'center';
+        ectx.fillText(cap.text, cx, cy);
+        ectx.textAlign = 'left';
       }
     }
 
-    recorder.stop();
+    // Play each segment in sequence
+    for (const seg of keepSegments) {
+      if (cancelled) break;
+
+      offVid.currentTime = seg.start;
+      await new Promise(r => { offVid.onseeked = r; });
+      offVid.play();
+
+      await new Promise((resolve) => {
+        function tick() {
+          if (cancelled) { resolve(); return; }
+
+          const t = offVid.currentTime;
+
+          // Stop when segment ends
+          if (t >= seg.end) {
+            offVid.pause();
+            exportedTime += seg.end - seg.start;
+            resolve();
+            return;
+          }
+
+          compositeFrame();
+          setExportProgress(
+            ((exportedTime + (t - seg.start)) / totalKeepDuration) * 100,
+            `Rendering… ${fmt(exportedTime + (t - seg.start), 1)} / ${fmt(totalKeepDuration, 1)}`
+          );
+
+          rafId = requestAnimationFrame(tick);
+        }
+
+        offVid.onended = () => {
+          exportedTime += seg.end - seg.start;
+          resolve();
+        };
+
+        rafId = requestAnimationFrame(tick);
+      });
+    }
+
+    if (!cancelled) recorder.stop();
 
   } catch (err) {
     document.getElementById('export-modal').classList.remove('open');
